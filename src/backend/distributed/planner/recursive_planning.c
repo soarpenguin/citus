@@ -50,6 +50,7 @@
  */
 
 #include "postgres.h"
+#include "utils/lsyscache.h"
 
 #include "catalog/pg_type.h"
 #include "catalog/pg_class.h"
@@ -162,7 +163,10 @@ static bool CteReferenceListWalker(Node *node, CteReferenceWalkerContext *contex
 static bool ContainsReferencesToOuterQuery(Query *query);
 static bool ContainsReferencesToOuterQueryWalker(Node *node,
 												 VarLevelsUpWalkerContext *context);
-
+static void WrapFunctionsInQuery(Query *query);
+static bool ShouldWrapFunctionsInQuery(Query *query);
+static void WrapRteFunctionIntoRteSubquery(RangeTblEntry *rteFunction);
+static bool IsRteRowType(RangeTblEntry *rte);
 
 /*
  * GenerateSubplansForSubqueriesAndCTEs is a wrapper around RecursivelyPlanSubqueriesAndCTEs.
@@ -261,6 +265,18 @@ RecursivelyPlanSubqueriesAndCTEs(Query *query, RecursivePlanningContext *context
 		 * subquery_pushdown is enabled.
 		 */
 		return NULL;
+	}
+
+	/* make sure function calls in joins are executed in the coordinator */
+	if (ShouldWrapFunctionsInQuery(query))
+	{
+		/*
+		 * At this point, we know that there is at least one function in the
+		 * query rangeTableList. We wrap all the functions used in joins
+		 * inside (SELECT * FROM func()) calls so that they are executed on
+		 * the coordinator.
+		 * */
+		WrapFunctionsInQuery(query);
 	}
 
 	/* descend into subqueries */
@@ -1302,6 +1318,148 @@ ContainsReferencesToOuterQueryWalker(Node *node, VarLevelsUpWalkerContext *conte
 
 	return expression_tree_walker(node, ContainsReferencesToOuterQueryWalker,
 								  context);
+}
+
+
+/*
+ * WrapFunctionsInQuery iterates over all the immediate Range Table Entries
+ * of a query and wraps all the functions inside (SELECT * FROM fnc() f)
+ * subqueries.
+ *
+ * We currently wrap only those functions that return a single value. If a
+ * function returns records or a table we leave it as it is
+ * */
+static void
+WrapFunctionsInQuery(Query *query)
+{
+	List *rangeTableList = query->rtable;
+	ListCell *rangeTableCell = NULL;
+
+	foreach(rangeTableCell, rangeTableList)
+	{
+		RangeTblEntry *rangeTableEntry = (RangeTblEntry *) lfirst(rangeTableCell);
+
+		if (rangeTableEntry->rtekind == RTE_FUNCTION &&
+			!IsRteRowType(rangeTableEntry))
+		{
+			WrapRteFunctionIntoRteSubquery(rangeTableEntry);
+		}
+	}
+}
+
+
+/*
+ * WrapRteFunctionIntoRteSubquery wraps a given function RangeTableEntry
+ * inside a (SELECT * from function() f) subquery.
+ *
+ * The said RangeTableEntry is modified and now points to the new subquery.
+ * */
+static void
+WrapRteFunctionIntoRteSubquery(RangeTblEntry *rteFunction)
+{
+	Query *subquery = makeNode(Query);
+	RangeTblRef *newRangeTableRef = makeNode(RangeTblRef);
+	RangeTblEntry *newRangeTableEntry = NULL;
+	Var *targetColumn = NULL;
+	TargetEntry *targetEntry = NULL;
+	List *functionColumnNames = rteFunction->eref->colnames;
+	ListCell *functionColumnName = NULL;
+	int targetColumnCounter = 0;
+
+	/* we support wrapping functions returning only one column for now */
+	if (list_length(functionColumnNames) != 1)
+	{
+		return;
+	}
+
+	subquery->commandType = CMD_SELECT;
+
+	/* we copy the input rteFunction to prevent cycles */
+	newRangeTableEntry = copyObject(rteFunction);
+
+
+	/* set the FROM expression to the subquery */
+	subquery->rtable = list_make1(newRangeTableEntry);
+	newRangeTableRef->rtindex = 1;
+	subquery->jointree = makeFromExpr(list_make1(newRangeTableRef), NULL);
+
+	/* subquery needs to return the whole row function returns */
+	targetColumn = makeWholeRowVar(newRangeTableEntry,
+								   (Index) newRangeTableRef->rtindex, 0,
+								   true);
+
+	/* create target entries for all columns returned by the function */
+	foreach(functionColumnName, functionColumnNames)
+	{
+		char *columnName = strVal(lfirst(functionColumnName));
+
+		targetEntry = makeTargetEntry((Expr *) targetColumn,
+									  ++targetColumnCounter, columnName, false);
+		subquery->targetList = lappend(subquery->targetList, targetEntry);
+	}
+
+	/* replace the function with the constructed subquery */
+	rteFunction->rtekind = RTE_SUBQUERY;
+	rteFunction->subquery = subquery;
+}
+
+
+/*
+ * ShouldWrapFunctionsInQuery decides if there are any functions used in
+ * joins in the query.
+ * */
+static bool
+ShouldWrapFunctionsInQuery(Query *query)
+{
+	List *rangeTableList = query->rtable;
+	ListCell *rangeTableCell = NULL;
+
+	/* there needs to be at least two RTEs for a join operation */
+	if (list_length(rangeTableList) < 2)
+	{
+		return false;
+	}
+	/* search for a function in the rangeTable */
+	else
+	{
+		foreach(rangeTableCell, rangeTableList)
+		{
+			RangeTblEntry *rangeTableEntry = (RangeTblEntry *) lfirst(rangeTableCell);
+
+			/*
+			 * If there is at least one function we should wrap it in a
+			 * (SELECT * FROM fnc() f) subquery.
+			 * */
+			if (rangeTableEntry->rtekind == RTE_FUNCTION && !IsRteRowType
+					(rangeTableEntry))
+			{
+				return true;
+			}
+		}
+	}
+
+	/* no need to wrap functions if there are no joins or no functions */
+	return false;
+}
+
+
+/*
+ * IsRteRowType determines whether a Function RTE has a "rowtype" type
+ *
+ * "rowtype" type is defined in Postgres as either a:
+ * - RECORD
+ * - a named composite type (including a domain over a named composite type).
+ * */
+static bool
+IsRteRowType(RangeTblEntry *rte)
+{
+	Assert(rte->rtekind == RTE_FUNCTION);
+	Assert(IsA(rte->functions, List));
+	Assert(list_length(rte->functions) == 1);
+
+	Node *fexpr = ((RangeTblFunction *) linitial(rte->functions))->funcexpr;
+	Oid toid = exprType(fexpr);
+	return type_is_rowtype(toid);
 }
 
 
