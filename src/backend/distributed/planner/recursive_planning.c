@@ -1453,13 +1453,17 @@ ShouldWrapFunctionsInQuery(Query *query)
 static bool
 IsRteRowType(RangeTblEntry *rte)
 {
+	Node *functionExpression = NULL;
+	Oid functionTypeOID = 0;
+
 	Assert(rte->rtekind == RTE_FUNCTION);
 	Assert(IsA(rte->functions, List));
 	Assert(list_length(rte->functions) == 1);
 
-	Node *fexpr = ((RangeTblFunction *) linitial(rte->functions))->funcexpr;
-	Oid toid = exprType(fexpr);
-	return type_is_rowtype(toid);
+	functionExpression = ((RangeTblFunction *) linitial(rte->functions))
+						 ->funcexpr;
+	functionTypeOID = exprType(functionExpression);
+	return type_is_rowtype(functionTypeOID);
 }
 
 
