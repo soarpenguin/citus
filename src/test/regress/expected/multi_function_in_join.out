@@ -20,7 +20,7 @@ SELECT create_distributed_table('table1','id');
 (1 row)
 
 INSERT INTO table1
-SELECT x, x
+SELECT x, x*x
 from generate_series(1, 100) as f (x);
 -- Verbose messages for observing the subqueries that wrapped function calls
 SET client_min_messages TO DEBUG;
@@ -43,7 +43,7 @@ DEBUG:  generating subplan 3_1 for subquery SELECT sum FROM functions_in_joins.a
 DEBUG:  Plan 3 query after replacing subqueries and CTEs: SELECT table1.id, table1.data, sum.sum FROM (functions_in_joins.table1 JOIN (SELECT intermediate_result.sum FROM read_intermediate_result('3_1'::text, 'binary'::citus_copy_format) intermediate_result(sum integer)) sum ON ((table1.id OPERATOR(pg_catalog.=) sum.sum)))
  id | data | sum 
 ----+------+-----
-  8 |    8 |   8
+  8 |   64 |   8
 (1 row)
 
 -- Check join of plpgsql functions
@@ -58,7 +58,7 @@ DEBUG:  generating subplan 4_1 for subquery SELECT val FROM functions_in_joins.i
 DEBUG:  Plan 4 query after replacing subqueries and CTEs: SELECT table1.id, table1.data, val.val FROM (functions_in_joins.table1 JOIN (SELECT intermediate_result.val FROM read_intermediate_result('4_1'::text, 'binary'::citus_copy_format) intermediate_result(val integer)) val ON ((table1.id OPERATOR(pg_catalog.=) val.val)))
  id | data | val 
 ----+------+-----
-  3 |    3 |   3
+  3 |    9 |   3
 (1 row)
 
 -- a function that returns a set of integers
@@ -77,8 +77,8 @@ DEBUG:  generating subplan 5_1 for subquery SELECT result FROM functions_in_join
 DEBUG:  Plan 5 query after replacing subqueries and CTEs: SELECT table1.id, table1.data, next_integers.result FROM (functions_in_joins.table1 JOIN (SELECT intermediate_result.result FROM read_intermediate_result('5_1'::text, 'binary'::citus_copy_format) intermediate_result(result integer)) next_integers ON ((table1.id OPERATOR(pg_catalog.=) next_integers.result))) ORDER BY table1.id
  id | data | result 
 ----+------+--------
-  3 |    3 |      3
-  4 |    4 |      4
+  3 |    9 |      3
+  4 |   16 |      4
 (2 rows)
 
 -- a stable function
@@ -94,14 +94,43 @@ DEBUG:  Plan 6 query after replacing subqueries and CTEs: SELECT table1.id, tabl
 
 -- a built-in immutable function
 SELECT * FROM table1 JOIN abs(100) as hundred ON (id = hundred);
- id  | data | hundred 
------+------+---------
- 100 |  100 |     100
+ id  | data  | hundred 
+-----+-------+---------
+ 100 | 10000 |     100
 (1 row)
 
--- The following tests will fail as we do not support functions returning
--- multiple columns and user-defined immutable ones yet.
+-- function joins inside a CTE
+WITH next_row_to_process AS (
+    SELECT * FROM table1 JOIN nextval('numbers') n ON (id = n)
+    )
+SELECT *
+FROM table1, next_row_to_process
+WHERE table1.data <= next_row_to_process.data;
+DEBUG:  generating subplan 9_1 for CTE next_row_to_process: SELECT table1.id, table1.data, n.n FROM (functions_in_joins.table1 JOIN nextval('functions_in_joins.numbers'::regclass) n(n) ON ((table1.id OPERATOR(pg_catalog.=) n.n)))
+DEBUG:  generating subplan 10_1 for subquery SELECT n FROM nextval('functions_in_joins.numbers'::regclass) n(n)
+DEBUG:  Plan 10 query after replacing subqueries and CTEs: SELECT table1.id, table1.data, n.n FROM (functions_in_joins.table1 JOIN (SELECT intermediate_result.n FROM read_intermediate_result('10_1'::text, 'binary'::citus_copy_format) intermediate_result(n bigint)) n ON ((table1.id OPERATOR(pg_catalog.=) n.n)))
+DEBUG:  Plan 9 query after replacing subqueries and CTEs: SELECT table1.id, table1.data, next_row_to_process.id, next_row_to_process.data, next_row_to_process.n FROM functions_in_joins.table1, (SELECT intermediate_result.id, intermediate_result.data, intermediate_result.n FROM read_intermediate_result('9_1'::text, 'binary'::citus_copy_format) intermediate_result(id integer, data integer, n bigint)) next_row_to_process WHERE (table1.data OPERATOR(pg_catalog.<=) next_row_to_process.data)
+ id | data | id | data | n 
+----+------+----+------+---
+  1 |    1 |  2 |    4 | 2
+  2 |    4 |  2 |    4 | 2
+(2 rows)
+
+-- The following tests will fail as we do not support  all joins on
+-- all kinds of functions
 SET client_min_messages TO ERROR;
+-- function joins in CTE results can create lateral joins that are not supported
+SELECT public.raise_failed_execution($cmd$
+WITH one_row AS (
+    SELECT * FROM table1 WHERE id=52
+    )
+SELECT table1.id, table1.data
+FROM one_row, table1, next_k_integers(one_row.id, 5) next_five_ids
+WHERE table1.id = next_five_ids;
+$cmd$);
+ERROR:  Task failed to execute
+CONTEXT:  PL/pgSQL function public.raise_failed_execution(text) line 6 at RAISE
+-- a function returning table
 CREATE FUNCTION get_two_column_table() RETURNS TABLE(x int,y int) AS
 $cmd$
 SELECT x, x+1 FROM generate_series(0,4) f(x)
@@ -112,6 +141,7 @@ SELECT * FROM table1 JOIN get_two_column_table() t2 ON (id = x)
 $cmd$);
 ERROR:  Task failed to execute
 CONTEXT:  PL/pgSQL function public.raise_failed_execution(text) line 6 at RAISE
+-- a function returning records
 CREATE FUNCTION get_set_of_records() RETURNS SETOF RECORD AS $cmd$
 SELECT x, x+1 FROM generate_series(0,4) f(x)
 $cmd$
@@ -126,6 +156,25 @@ CREATE OR REPLACE FUNCTION the_answer_to_life()
   RETURNS INTEGER IMMUTABLE AS 'SELECT 42' LANGUAGE SQL;
 SELECT public.raise_failed_execution($cmd$
 SELECT * FROM table1 JOIN the_answer_to_life() the_answer ON (id = the_answer)
+$cmd$);
+ERROR:  Task failed to execute
+CONTEXT:  PL/pgSQL function public.raise_failed_execution(text) line 6 at RAISE
+-- Multiple functions in an RTE
+-- NOTE: Wrapping the functions in subqueries does not work as postgres does
+-- not allow having a subquery after a ROWS FROM clause.
+SELECT public.raise_failed_execution($cmd$
+SELECT * FROM ROWS FROM (next_k_integers(5), next_k_integers(10)) AS f(a, b),
+    table1 WHERE id = a;
+$cmd$);
+ERROR:  Task failed to execute
+CONTEXT:  PL/pgSQL function public.raise_failed_execution(text) line 6 at RAISE
+-- WITH ORDINALITY clause forcing the result type to be RECORD/RECORDs
+SELECT public.raise_failed_execution($cmd$
+SELECT *
+FROM table1
+       JOIN next_k_integers(10,5) WITH ORDINALITY next_integers
+         ON (id = next_integers.result)
+ORDER BY id ASC;
 $cmd$);
 ERROR:  Task failed to execute
 CONTEXT:  PL/pgSQL function public.raise_failed_execution(text) line 6 at RAISE

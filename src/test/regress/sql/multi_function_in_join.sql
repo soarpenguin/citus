@@ -18,7 +18,7 @@ CREATE TABLE table1 (id int, data int);
 SELECT create_distributed_table('table1','id');
 
 INSERT INTO table1
-SELECT x, x
+SELECT x, x*x
 from generate_series(1, 100) as f (x);
 
 -- Verbose messages for observing the subqueries that wrapped function calls
@@ -64,9 +64,30 @@ SELECT * FROM table1 JOIN the_minimum_id() min_id ON (id = min_id);
 -- a built-in immutable function
 SELECT * FROM table1 JOIN abs(100) as hundred ON (id = hundred);
 
--- The following tests will fail as we do not support functions returning
--- multiple columns and user-defined immutable ones yet.
+-- function joins inside a CTE
+WITH next_row_to_process AS (
+    SELECT * FROM table1 JOIN nextval('numbers') n ON (id = n)
+    )
+SELECT *
+FROM table1, next_row_to_process
+WHERE table1.data <= next_row_to_process.data;
+
+
+-- The following tests will fail as we do not support  all joins on
+-- all kinds of functions
 SET client_min_messages TO ERROR;
+
+-- function joins in CTE results can create lateral joins that are not supported
+SELECT public.raise_failed_execution($cmd$
+WITH one_row AS (
+    SELECT * FROM table1 WHERE id=52
+    )
+SELECT table1.id, table1.data
+FROM one_row, table1, next_k_integers(one_row.id, 5) next_five_ids
+WHERE table1.id = next_five_ids;
+$cmd$);
+
+-- a function returning table
 CREATE FUNCTION get_two_column_table() RETURNS TABLE(x int,y int) AS
 $cmd$
 SELECT x, x+1 FROM generate_series(0,4) f(x)
@@ -76,6 +97,7 @@ SELECT public.raise_failed_execution($cmd$
 SELECT * FROM table1 JOIN get_two_column_table() t2 ON (id = x)
 $cmd$);
 
+-- a function returning records
 CREATE FUNCTION get_set_of_records() RETURNS SETOF RECORD AS $cmd$
 SELECT x, x+1 FROM generate_series(0,4) f(x)
 $cmd$
@@ -90,6 +112,24 @@ CREATE OR REPLACE FUNCTION the_answer_to_life()
 SELECT public.raise_failed_execution($cmd$
 SELECT * FROM table1 JOIN the_answer_to_life() the_answer ON (id = the_answer)
 $cmd$);
+
+-- Multiple functions in an RTE
+-- NOTE: Wrapping the functions in subqueries does not work as postgres does
+-- not allow having a subquery after a ROWS FROM clause.
+SELECT public.raise_failed_execution($cmd$
+SELECT * FROM ROWS FROM (next_k_integers(5), next_k_integers(10)) AS f(a, b),
+    table1 WHERE id = a;
+$cmd$);
+
+-- WITH ORDINALITY clause forcing the result type to be RECORD/RECORDs
+SELECT public.raise_failed_execution($cmd$
+SELECT *
+FROM table1
+       JOIN next_k_integers(10,5) WITH ORDINALITY next_integers
+         ON (id = next_integers.result)
+ORDER BY id ASC;
+$cmd$);
+
 
 RESET client_min_messages;
 DROP SCHEMA functions_in_joins CASCADE;
