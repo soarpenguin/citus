@@ -61,6 +61,7 @@ typedef struct MultiConnectionReady
 static void MultiConnectionReadyExecutePoll(MultiConnectionReady *mcr);
 static WaitEventSet * WaitEventSetFromMultiConnectionReadyArray(
 	MultiConnectionReady *connections, int numConnections, int *waitCount);
+static void EnsureReleaseResource(MemoryContextCallbackFunction callback, void *arg);
 
 
 static int CitusNoticeLogLevel = DEFAULT_CITUS_NOTICE_LEVEL;
@@ -583,6 +584,17 @@ WaitEventSetFromMultiConnectionReadyArray(MultiConnectionReady *connections,
 }
 
 
+static void
+EnsureReleaseResource(MemoryContextCallbackFunction callback, void *arg)
+{
+	MemoryContextCallback *cb = MemoryContextAllocZero(CurrentMemoryContext,
+													   sizeof(MemoryContextCallback));
+	cb->func = callback;
+	cb->arg = arg;
+	MemoryContextRegisterResetCallback(CurrentMemoryContext, cb);
+}
+
+
 /*
  * FinishConnectionListEstablishment is a wrapper around FinishConnectionEstablishment.
  * The function iterates over the multiConnectionList and finishes the connection
@@ -641,15 +653,14 @@ FinishConnectionListEstablishment(List *multiConnectionList)
 
 		if (waitEventSet == NULL || waitEventSetRebuild)
 		{
-			if (waitEventSet != NULL)
-			{
-				FreeWaitEventSet(waitEventSet);
-				waitEventSet = NULL;
-			}
-
 			waitEventSet = WaitEventSetFromMultiConnectionReadyArray(connections,
 																	 connectionCount,
 																	 &waitCount);
+
+			/* TODO use resource that only holds the last pointer and frees it on swap */
+			EnsureReleaseResource((MemoryContextCallbackFunction) (&FreeWaitEventSet),
+								  waitEventSet);
+
 			if (waitCount <= 0)
 			{
 				break;
@@ -677,10 +688,6 @@ FinishConnectionListEstablishment(List *multiConnectionList)
 
 				if (InterruptHoldoffCount > 0 && (QueryCancelPending || ProcDiePending))
 				{
-					/* TODO
-					 * figure out what todo with waitEventSet, possibly adding it to the
-					 * memory context, or just free it here
-					 */
 					return;
 				}
 
