@@ -9,6 +9,7 @@
  */
 
 #include "postgres.h"
+#include "pgstat.h"
 
 #ifdef HAVE_POLL_H
 #include <poll.h>
@@ -436,6 +437,145 @@ ShutdownConnection(MultiConnection *connection)
 	connection->pgConn = NULL;
 }
 
+typedef struct MultiConnectionReady
+{
+	MultiConnection *connection;
+	bool ready;
+	PostgresPollingStatusType pollmode;
+} MultiConnectionReady;
+
+/* prototypes TODO move to top */
+void MultiConnectionReadyExecutePoll(MultiConnectionReady *mcr);
+WaitEventSet * WaitEventSetFromMultiConnectionReadyArray(MultiConnectionReady *connections, int numConnections, int *waitCount);
+
+
+void
+MultiConnectionReadyExecutePoll(MultiConnectionReady *mcr)
+{
+
+	MultiConnection *connection = mcr->connection;
+	ConnStatusType status = PQstatus(connection->pgConn);
+
+	Assert(!mcr->ready);
+
+	if (status == CONNECTION_OK)
+	{
+		mcr->ready = true;
+		return;
+	}
+	else if (status == CONNECTION_BAD)
+	{
+		/* FIXME: retries? */
+		mcr->ready = true;
+		return;
+	}
+	else
+	{
+		mcr->ready = false;
+	}
+
+	mcr->pollmode = PQconnectPoll(connection->pgConn);
+
+	/*
+	 * FIXME: Do we want to add transparent retry support here?
+	 */
+	if (mcr->pollmode == PGRES_POLLING_FAILED)
+	{
+		mcr->ready = true;
+		return;
+	}
+	else if (mcr->pollmode == PGRES_POLLING_OK)
+	{
+		mcr->ready = true;
+		return;
+	}
+	else
+	{
+		Assert(mcr->pollmode == PGRES_POLLING_WRITING ||
+			   mcr->pollmode == PGRES_POLLING_READING);
+	}
+}
+
+
+/*
+ *
+ * waitCount populates the number of connections waiting for in case of a non NULL pointer is provided
+ */
+WaitEventSet *
+WaitEventSetFromMultiConnectionReadyArray(MultiConnectionReady *connections,
+		int numConnections, int *waitCount)
+{
+	WaitEventSet *waitEventSet = NULL;
+
+	/*
+	 * maxEvents is the value min(numConnections, FD_SETSIZE - 3), this is to not add more
+	 * wait events then the set can hold. -3 is used to have room for the following events
+	 * outside of the sockets:
+	 *  - WL_POSTMASTER_DEATH
+	 *  - WL_LATCH_SET
+	 *  - pgwin32_signal_event
+	 *
+	 *  During the loop events are added as long as maxEvents does not reach 0
+	 */
+	int maxEvents = numConnections;
+	if (maxEvents > (FD_SETSIZE - 3))
+	{
+		maxEvents = FD_SETSIZE - 3;
+	}
+
+	if (waitCount)
+	{
+		*waitCount = 0;
+	}
+
+	/* allocate pending connections + 2 for the signal latch and postmaster death */
+	/* (CreateWaitEventSet makes room for pgwin32_signal_event automatically) */
+	waitEventSet = CreateWaitEventSet(CurrentMemoryContext, maxEvents + 2);
+
+	/*
+	 * Put the wait events for the signal latch and postmaster death at the end such that
+	 * event index + pendingConnectionsStartIndex = the connection index in the array.
+	 */
+	AddWaitEventToSet(waitEventSet, WL_POSTMASTER_DEATH, PGINVALID_SOCKET, NULL, NULL);
+	AddWaitEventToSet(waitEventSet, WL_LATCH_SET, PGINVALID_SOCKET, MyLatch, NULL);
+
+	for (int i=0; i<numConnections && maxEvents > 0; i++)
+	{
+		if (connections[i].ready)
+		{
+			// skip the connection if it is ready
+			continue;
+		}
+
+		int socket = PQsocket(connections[i].connection->pgConn);
+		int eventMask = 0;
+
+		if (connections[i].pollmode == PGRES_POLLING_READING)
+		{
+			eventMask |= WL_SOCKET_READABLE;
+		}
+		else
+		{
+			eventMask |= WL_SOCKET_WRITEABLE;
+		}
+
+		AddWaitEventToSet(waitEventSet, eventMask, socket, NULL,
+				(void *)&connections[i]);
+
+		/* keep the maxEvents up to date with how many we can still add */
+		maxEvents--;
+
+		/* increment the waitCount if non NULL */
+		if (waitCount)
+		{
+			*waitCount = *waitCount + 1;
+		}
+	}
+
+	return waitEventSet;
+}
+
+
 
 /*
  * FinishConnectionListEstablishment is a wrapper around FinishConnectionEstablishment.
@@ -445,15 +585,103 @@ ShutdownConnection(MultiConnection *connection)
 void
 FinishConnectionListEstablishment(List *multiConnectionList)
 {
+	int connectionIndex = 0;
+	int connectionCount = 0;
+	MultiConnectionReady *connections = NULL;
 	ListCell *multiConnectionCell = NULL;
 
+	WaitEventSet *waitEventSet = NULL;
+	bool waitEventSetRebuild = false;
+	int waitCount = 0;
+	WaitEvent *events = NULL;
+
+	/*
+	 * Here we prepare an array that keeps the MultiConnection together with the
+	 * information on if and how to wait before PQconnectionPoll should be called on it
+	 */
+	connectionCount = list_length(multiConnectionList);
+	connections = (MultiConnectionReady *) palloc0(connectionCount * sizeof(MultiConnectionReady));
 	foreach(multiConnectionCell, multiConnectionList)
 	{
-		MultiConnection *multiConnection = (MultiConnection *) lfirst(
-			multiConnectionCell);
+		MultiConnection *connection = (MultiConnection *) lfirst(multiConnectionCell);
 
-		/* TODO: consider making connection establishment fully in parallel */
-		FinishConnectionEstablishment(multiConnection);
+		connections[connectionIndex].connection = connection;
+
+		/*
+		 * before we can build the waitset to wait for asynchronous IO we need to know the
+		 * pollmode to use for the sockets. This is populated by executing one round of
+		 * PQconnectPoll. This updates the MultiConnectionReady struct with the ready state
+		 * and its next poll mode.
+		 */
+		MultiConnectionReadyExecutePoll(&connections[connectionIndex]);
+
+		if (!connections[connectionIndex].ready)
+		{
+			waitCount++;
+		}
+
+		connectionIndex++;
+	}
+
+	/* prepapre space for socket events */
+	events = (WaitEvent *) palloc0(connectionCount * sizeof(WaitEvent));
+
+	while (waitCount > 0)
+	{
+		long timeout = -1;
+		int eventCount = 0;
+
+		if (waitEventSet == NULL || waitEventSetRebuild)
+		{
+			if (waitEventSet != NULL)
+			{
+				FreeWaitEventSet(waitEventSet);
+				waitEventSet = NULL;
+			}
+
+			waitEventSet = WaitEventSetFromMultiConnectionReadyArray(connections, connectionCount, &waitCount);
+			if (waitCount <= 0 )
+			{
+				break;
+			}
+		}
+
+		eventCount = WaitEventSetWait(waitEventSet, timeout, events, waitCount,
+				WAIT_EVENT_CLIENT_READ);
+
+		for (int eventIndex = 0; eventIndex < eventCount; eventIndex++)
+		{
+			WaitEvent *event = &events[eventIndex];
+			MultiConnectionReady *connection = (MultiConnectionReady *)event->user_data;
+
+			if (event->events & WL_POSTMASTER_DEATH)
+			{
+				ereport(ERROR, (errmsg("postmaster was shut down, exiting")));
+			}
+
+			if (event->events & WL_LATCH_SET)
+			{
+				ResetLatch(MyLatch);
+
+				CHECK_FOR_INTERRUPTS();
+
+				if (InterruptHoldoffCount > 0 && (QueryCancelPending || ProcDiePending))
+				{
+					/* TODO
+					 * figure out what todo with waitEventSet, possibly adding it to the
+					 * memory context, or just free it here
+					 */
+					return;
+				}
+
+				continue;
+			}
+
+			MultiConnectionReadyExecutePoll(connection);
+
+			/* TODO: actually test if the change from above should cause a rebuild */
+			waitEventSetRebuild = true;
+		}
 	}
 }
 
