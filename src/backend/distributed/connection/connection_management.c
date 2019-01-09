@@ -48,6 +48,20 @@ static void DefaultCitusNoticeProcessor(void *arg, const char *message);
 static MultiConnection * FindAvailableConnection(dlist_head *connections, uint32 flags);
 static bool RemoteTransactionIdle(MultiConnection *connection);
 
+/* types for async connection management */
+typedef struct MultiConnectionReady
+{
+	MultiConnection *connection;
+	bool ready;
+	PostgresPollingStatusType pollmode;
+} MultiConnectionReady;
+
+
+/* helper functions for async connection management */
+static void MultiConnectionReadyExecutePoll(MultiConnectionReady *mcr);
+static WaitEventSet * WaitEventSetFromMultiConnectionReadyArray(
+	MultiConnectionReady *connections, int numConnections, int *waitCount);
+
 
 static int CitusNoticeLogLevel = DEFAULT_CITUS_NOTICE_LEVEL;
 
@@ -437,22 +451,10 @@ ShutdownConnection(MultiConnection *connection)
 	connection->pgConn = NULL;
 }
 
-typedef struct MultiConnectionReady
-{
-	MultiConnection *connection;
-	bool ready;
-	PostgresPollingStatusType pollmode;
-} MultiConnectionReady;
 
-/* prototypes TODO move to top */
-void MultiConnectionReadyExecutePoll(MultiConnectionReady *mcr);
-WaitEventSet * WaitEventSetFromMultiConnectionReadyArray(MultiConnectionReady *connections, int numConnections, int *waitCount);
-
-
-void
+static void
 MultiConnectionReadyExecutePoll(MultiConnectionReady *mcr)
 {
-
 	MultiConnection *connection = mcr->connection;
 	ConnStatusType status = PQstatus(connection->pgConn);
 
@@ -501,11 +503,12 @@ MultiConnectionReadyExecutePoll(MultiConnectionReady *mcr)
  *
  * waitCount populates the number of connections waiting for in case of a non NULL pointer is provided
  */
-WaitEventSet *
+static WaitEventSet *
 WaitEventSetFromMultiConnectionReadyArray(MultiConnectionReady *connections,
-		int numConnections, int *waitCount)
+										  int numConnections, int *waitCount)
 {
 	WaitEventSet *waitEventSet = NULL;
+	int connectionIndex = 0;
 
 	/*
 	 * maxEvents is the value min(numConnections, FD_SETSIZE - 3), this is to not add more
@@ -539,18 +542,22 @@ WaitEventSetFromMultiConnectionReadyArray(MultiConnectionReady *connections,
 	AddWaitEventToSet(waitEventSet, WL_POSTMASTER_DEATH, PGINVALID_SOCKET, NULL, NULL);
 	AddWaitEventToSet(waitEventSet, WL_LATCH_SET, PGINVALID_SOCKET, MyLatch, NULL);
 
-	for (int i=0; i<numConnections && maxEvents > 0; i++)
+	for (connectionIndex = 0; connectionIndex < numConnections && maxEvents > 0;
+		 connectionIndex++)
 	{
-		if (connections[i].ready)
+		int socket = 0;
+		int eventMask = 0;
+
+		if (connections[connectionIndex].ready)
 		{
-			// skip the connection if it is ready
+			/* connections that are ready will not be added to the WaitSet */
 			continue;
 		}
 
-		int socket = PQsocket(connections[i].connection->pgConn);
-		int eventMask = 0;
+		socket = PQsocket(connections[connectionIndex].connection->pgConn);
 
-		if (connections[i].pollmode == PGRES_POLLING_READING)
+		eventMask = 0;
+		if (connections[connectionIndex].pollmode == PGRES_POLLING_READING)
 		{
 			eventMask |= WL_SOCKET_READABLE;
 		}
@@ -560,7 +567,7 @@ WaitEventSetFromMultiConnectionReadyArray(MultiConnectionReady *connections,
 		}
 
 		AddWaitEventToSet(waitEventSet, eventMask, socket, NULL,
-				(void *)&connections[i]);
+						  (void *) &connections[connectionIndex]);
 
 		/* keep the maxEvents up to date with how many we can still add */
 		maxEvents--;
@@ -574,7 +581,6 @@ WaitEventSetFromMultiConnectionReadyArray(MultiConnectionReady *connections,
 
 	return waitEventSet;
 }
-
 
 
 /*
@@ -600,7 +606,8 @@ FinishConnectionListEstablishment(List *multiConnectionList)
 	 * information on if and how to wait before PQconnectionPoll should be called on it
 	 */
 	connectionCount = list_length(multiConnectionList);
-	connections = (MultiConnectionReady *) palloc0(connectionCount * sizeof(MultiConnectionReady));
+	connections = (MultiConnectionReady *) palloc0(connectionCount *
+												   sizeof(MultiConnectionReady));
 	foreach(multiConnectionCell, multiConnectionList)
 	{
 		MultiConnection *connection = (MultiConnection *) lfirst(multiConnectionCell);
@@ -630,6 +637,7 @@ FinishConnectionListEstablishment(List *multiConnectionList)
 	{
 		long timeout = -1;
 		int eventCount = 0;
+		int eventIndex = 0;
 
 		if (waitEventSet == NULL || waitEventSetRebuild)
 		{
@@ -639,20 +647,22 @@ FinishConnectionListEstablishment(List *multiConnectionList)
 				waitEventSet = NULL;
 			}
 
-			waitEventSet = WaitEventSetFromMultiConnectionReadyArray(connections, connectionCount, &waitCount);
-			if (waitCount <= 0 )
+			waitEventSet = WaitEventSetFromMultiConnectionReadyArray(connections,
+																	 connectionCount,
+																	 &waitCount);
+			if (waitCount <= 0)
 			{
 				break;
 			}
 		}
 
 		eventCount = WaitEventSetWait(waitEventSet, timeout, events, waitCount,
-				WAIT_EVENT_CLIENT_READ);
+									  WAIT_EVENT_CLIENT_READ);
 
-		for (int eventIndex = 0; eventIndex < eventCount; eventIndex++)
+		for (eventIndex = 0; eventIndex < eventCount; eventIndex++)
 		{
 			WaitEvent *event = &events[eventIndex];
-			MultiConnectionReady *connection = (MultiConnectionReady *)event->user_data;
+			MultiConnectionReady *connection = (MultiConnectionReady *) event->user_data;
 
 			if (event->events & WL_POSTMASTER_DEATH)
 			{
