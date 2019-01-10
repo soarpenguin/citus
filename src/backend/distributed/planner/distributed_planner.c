@@ -709,31 +709,41 @@ CreateDistributedPlan(uint64 planId, Query *originalQuery, Query *query, ParamLi
 		/* create a fresh new planner context */
 		plannerRestrictionContext = CreateAndPushPlannerRestrictionContext();
 
-		/*
-		 * We force standard_planner to treat partitioned tables as regular tables
-		 * by clearing the inh flag on RTEs. We already did this at the start of
-		 * distributed_planner, but on a copy of the original query, so we need
-		 * to do it again here.
-		 */
-		AdjustPartitioningForDistributedPlanning(newQuery, setPartitionedTablesInherited);
+		PG_TRY();
+		{
+			/*
+			 * We force standard_planner to treat partitioned tables as regular tables
+			 * by clearing the inh flag on RTEs. We already did this at the start of
+			 * distributed_planner, but on a copy of the original query, so we need
+			 * to do it again here.
+			 */
+			AdjustPartitioningForDistributedPlanning(newQuery,
+													 setPartitionedTablesInherited);
 
-		/*
-		 * Some relations may have been removed from the query, but we can skip
-		 * AssignRTEIdentities since we currently do not rely on RTE identities
-		 * being contiguous.
-		 */
+			/*
+			 * Some relations may have been removed from the query, but we can skip
+			 * AssignRTEIdentities since we currently do not rely on RTE identities
+			 * being contiguous.
+			 */
 
-		standard_planner(newQuery, 0, boundParams);
+			standard_planner(newQuery, 0, boundParams);
 
-		/* overwrite the old transformed query with the new transformed query */
-		memcpy(query, newQuery, sizeof(Query));
+			/* overwrite the old transformed query with the new transformed query */
+			memcpy(query, newQuery, sizeof(Query));
 
-		/* recurse into CreateDistributedPlan with subqueries/CTEs replaced */
-		distributedPlan = CreateDistributedPlan(planId, originalQuery, query, NULL, false,
-												plannerRestrictionContext);
-		distributedPlan->subPlanList = subPlanList;
+			/* recurse into CreateDistributedPlan with subqueries/CTEs replaced */
+			distributedPlan = CreateDistributedPlan(planId, originalQuery, query, NULL,
+													false, plannerRestrictionContext);
+			distributedPlan->subPlanList = subPlanList;
 
-		return distributedPlan;
+			return distributedPlan;
+		}
+		PG_CATCH();
+		{
+			PopPlannerRestrictionContext();
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
 	}
 
 	/*
