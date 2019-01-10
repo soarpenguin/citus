@@ -62,6 +62,11 @@ static void MultiConnectionReadyExecutePoll(MultiConnectionReady *mcr);
 static WaitEventSet * WaitEventSetFromMultiConnectionReadyArray(
 	MultiConnectionReady *connections, int numConnections, int *waitCount);
 static void EnsureReleaseResource(MemoryContextCallbackFunction callback, void *arg);
+static int DeadlineTimestampTzToTimeout(TimestampTz deadline);
+static bool CheckConnectionsTimeout(MultiConnectionReady *connections, int
+									connectionCount);
+static void CloseNotReadyConnections(MultiConnectionReady *connections, int
+									 connectionCount);
 
 
 static int CitusNoticeLogLevel = DEFAULT_CITUS_NOTICE_LEVEL;
@@ -605,6 +610,7 @@ FinishConnectionListEstablishment(List *multiConnectionList)
 {
 	int connectionIndex = 0;
 	int connectionCount = 0;
+	TimestampTz deadline = 0;
 	MultiConnectionReady *connections = NULL;
 	ListCell *multiConnectionCell = NULL;
 
@@ -623,6 +629,12 @@ FinishConnectionListEstablishment(List *multiConnectionList)
 	foreach(multiConnectionCell, multiConnectionList)
 	{
 		MultiConnection *connection = (MultiConnection *) lfirst(multiConnectionCell);
+		TimestampTz connectionDeadline = TimestampTzPlusMilliseconds(
+			connection->connectionStart, NodeConnectionTimeout);
+		if (connectionDeadline > deadline)
+		{
+			deadline = connectionDeadline;
+		}
 
 		connections[connectionIndex].connection = connection;
 
@@ -647,7 +659,7 @@ FinishConnectionListEstablishment(List *multiConnectionList)
 
 	while (waitCount > 0)
 	{
-		long timeout = -1;
+		long timeout = DeadlineTimestampTzToTimeout(deadline);
 		int eventCount = 0;
 		int eventIndex = 0;
 
@@ -699,7 +711,81 @@ FinishConnectionListEstablishment(List *multiConnectionList)
 			/* TODO: actually test if the change from above should cause a rebuild */
 			waitEventSetRebuild = true;
 		}
+
+		if (eventCount == 0)
+		{
+			/*
+			 * timeout has occured, lets check there is an actual timeout, report if that
+			 * is the case and close all non-connected sockets
+			 */
+
+			bool timeoutOccured = CheckConnectionsTimeout(connections, connectionCount);
+			if (timeoutOccured)
+			{
+				ereport(WARNING, (errmsg("could not establish connection after %u ms",
+										 NodeConnectionTimeout)));
+				CloseNotReadyConnections(connections, connectionCount);
+
+				/* we are done waiting for the sockets */
+				return;
+			}
+		}
 	}
+}
+
+
+static int
+DeadlineTimestampTzToTimeout(TimestampTz deadline)
+{
+	long secs = 0;
+	int msecs = 0;
+	TimestampDifference(GetCurrentTimestamp(), deadline, &secs, &msecs);
+	return secs * 1000 + msecs / 1000;
+}
+
+
+static void
+CloseNotReadyConnections(MultiConnectionReady *connections, int connectionCount)
+{
+	int connectionIndex = 0;
+	for (connectionIndex = 0; connectionIndex < connectionCount; connectionIndex++)
+	{
+		MultiConnection *connection = connections[connectionIndex].connection;
+		if (connections[connectionIndex].ready)
+		{
+			continue;
+		}
+
+		/* close connection, otherwise we take up resource on the other side */
+		PQfinish(connection->pgConn);
+		connection->pgConn = NULL;
+	}
+}
+
+
+static bool
+CheckConnectionsTimeout(MultiConnectionReady *connections, int connectionCount)
+{
+	int connectionIndex = 0;
+	TimestampTz now = GetCurrentTimestamp();
+
+	for (connectionIndex = 0; connectionIndex < connectionCount; connectionIndex++)
+	{
+		MultiConnection *connection = connections[connectionIndex].connection;
+		if (connections[connectionIndex].ready)
+		{
+			/* skip the deadline test for connections that are already established */
+			continue;
+		}
+
+		if (TimestampDifferenceExceeds(connection->connectionStart, now,
+									   NodeConnectionTimeout))
+		{
+			return true;
+		}
+	}
+
+	return false;
 }
 
 
