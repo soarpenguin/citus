@@ -540,6 +540,8 @@ WaitEventSetFromMultiConnectionReadyArray(MultiConnectionReady *connections,
 	/* allocate pending connections + 2 for the signal latch and postmaster death */
 	/* (CreateWaitEventSet makes room for pgwin32_signal_event automatically) */
 	waitEventSet = CreateWaitEventSet(CurrentMemoryContext, maxEvents + 2);
+	EnsureReleaseResource((MemoryContextCallbackFunction) (&FreeWaitEventSet),
+						  waitEventSet);
 
 	/*
 	 * Put the wait events for the signal latch and postmaster death at the end such that
@@ -615,9 +617,10 @@ FinishConnectionListEstablishment(List *multiConnectionList)
 	ListCell *multiConnectionCell = NULL;
 
 	WaitEventSet *waitEventSet = NULL;
-	bool waitEventSetRebuild = false;
+	bool waitEventSetRebuild = true;
 	int waitCount = 0;
 	WaitEvent *events = NULL;
+	MemoryContext oldContext = NULL;
 
 	/*
 	 * Here we prepare an array that keeps the MultiConnection together with the
@@ -657,21 +660,26 @@ FinishConnectionListEstablishment(List *multiConnectionList)
 	/* prepapre space for socket events */
 	events = (WaitEvent *) palloc0(connectionCount * sizeof(WaitEvent));
 
+	/*
+	 * for high connection counts with lots of round trips we could potentially have a lot
+	 * of (big) waitsets that we'd like to clean right after we have used them. To do this
+	 * we switch to a temporary memory context for this loop which gets reset at the end
+	 */
+	oldContext = MemoryContextSwitchTo(AllocSetContextCreate(CurrentMemoryContext,
+															 "connection establishment temporary context",
+															 ALLOCSET_DEFAULT_SIZES));
 	while (waitCount > 0)
 	{
 		long timeout = DeadlineTimestampTzToTimeout(deadline);
 		int eventCount = 0;
 		int eventIndex = 0;
 
-		if (waitEventSet == NULL || waitEventSetRebuild)
+		if (waitEventSetRebuild)
 		{
+			MemoryContextReset(CurrentMemoryContext);
 			waitEventSet = WaitEventSetFromMultiConnectionReadyArray(connections,
 																	 connectionCount,
 																	 &waitCount);
-
-			/* TODO use resource that only holds the last pointer and frees it on swap */
-			EnsureReleaseResource((MemoryContextCallbackFunction) (&FreeWaitEventSet),
-								  waitEventSet);
 
 			if (waitCount <= 0)
 			{
@@ -700,6 +708,11 @@ FinishConnectionListEstablishment(List *multiConnectionList)
 
 				if (InterruptHoldoffCount > 0 && (QueryCancelPending || ProcDiePending))
 				{
+					/*
+					 * because we can't break from 2 loops easily we need to not forget to
+					 * reset the memory context
+					 */
+					MemoryContextDelete(MemoryContextSwitchTo(oldContext));
 					return;
 				}
 
@@ -727,10 +740,11 @@ FinishConnectionListEstablishment(List *multiConnectionList)
 				CloseNotReadyConnections(connections, connectionCount);
 
 				/* we are done waiting for the sockets */
-				return;
+				break;
 			}
 		}
 	}
+	MemoryContextDelete(MemoryContextSwitchTo(oldContext));
 }
 
 
