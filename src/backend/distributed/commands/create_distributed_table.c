@@ -1145,7 +1145,7 @@ CanUseExclusiveConnections(Oid relationId, bool localTableEmpty)
 	{
 		return false;
 	}
-	else if (!localTableEmpty || IsTransactionBlock())
+	else if (!localTableEmpty || IsMultiStatementTransaction())
 	{
 		return true;
 	}

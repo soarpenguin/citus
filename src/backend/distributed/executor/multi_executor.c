@@ -33,6 +33,7 @@
 #include "nodes/makefuncs.h"
 #include "parser/parsetree.h"
 #include "storage/lmgr.h"
+#include "tcop/dest.h"
 #include "tcop/pquery.h"
 #include "tcop/utility.h"
 #include "utils/snapmgr.h"
@@ -92,6 +93,48 @@ CitusExecutorStart(QueryDesc *queryDesc, int eflags)
 #endif
 	{
 		standard_ExecutorStart(queryDesc, eflags);
+	}
+}
+
+
+/*
+ * CitusExecutorRun is a wrapper around standard_ExecutorRun that keeps track of
+ * whether the current execution is in a function call (or SPI).
+ *
+ * When a distributed statement is executed in a transaction block, we need to
+ * make sure that we also run statements in a transaction block on the workers
+ * because they may have to be rolled back. The same applies to statements in
+ * a PL/pgSQL function, but there appears to be no Postgres function for
+ * detecting that we are in a PL/pgSQL function. However, since PL/pgSQL functions
+ * are executed through SPI, we can check the DestReceiver here.
+ */
+void
+CitusExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count,
+				 bool executeOnce)
+{
+	DestReceiver *destReceiver = queryDesc->dest;
+	int originalLevel = FunctionCallLevel;
+
+	if (destReceiver->mydest == DestSPI)
+	{
+		/*
+		 * If the query runs via SPI, we assume we're in a function call
+		 * and we should treat statements as part of a bigger transaction.
+		 * We reset this counter to 0 in the abort handler.
+		 */
+		FunctionCallLevel++;
+	}
+
+	standard_ExecutorRun(queryDesc, direction, count, executeOnce);
+
+	if (destReceiver->mydest == DestSPI)
+	{
+		/*
+		 * Restore the original value. It is not sufficient to decrease
+		 * the value because exceptions might cause us to go back a few
+		 * levels at once.
+		 */
+		FunctionCallLevel = originalLevel;
 	}
 }
 

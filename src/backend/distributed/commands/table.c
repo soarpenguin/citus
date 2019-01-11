@@ -1166,7 +1166,7 @@ SetupExecutionModeForAlterTable(Oid relationId, AlterTableCmd *command)
 		if (ColumnAppearsInForeignKeyToReferenceTable(affectedColumnName,
 													  relationId))
 		{
-			if (IsTransactionBlock() && alterTableType == AT_AlterColumnType)
+			if (alterTableType == AT_AlterColumnType)
 			{
 				SetLocalMultiShardModifyModeToSequential();
 			}
